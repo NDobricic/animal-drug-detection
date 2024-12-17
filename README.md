@@ -1,4 +1,3 @@
-
 ## Project Overview
 
 This project contains data files in CSV format, each representing the x-y center-of-mass coordinates of a single worm across different experimental conditions. The dataset is organized into two main experimental categories:
@@ -67,7 +66,7 @@ For related research on worm behavior and optogenetics, see the study: [Worm Per
 Ensure that you have [Miniconda](https://docs.conda.io/en/latest/miniconda.html) or [Anaconda](https://www.anaconda.com/products/distribution) installed on your system.
 
 #### 2. Create a Conda Environment
-Use the provided `environment.yml` file to create a Conda environment named `animal-drug-detection`:
+Use the provided `environment.yml` file to create a Conda environment named `animal-lifespan-prediction`:
 
 ```bash
 conda env create -f environment.yml
@@ -77,16 +76,5 @@ conda env create -f environment.yml
 After the environment is created, activate it using:
 
 ```bash
-conda activate animal-drug-detection
+conda activate animal-lifespan-prediction
 ```
-
----
-
-### How to Use the Data
-1. **Behavior Analysis**: Examine movement patterns across different conditions and timeframes.
-2. **Comparative Studies**:
-   - Compare worm behavior between `companyDrug` and `control` subfolders in the lifespan experiment.
-   - Analyze differences in response to light between `ATR+` and `ATR-` groups in the optogenetics experiment.
-3. **Identify Patterns**: Look for behavioral trends, consistent traits, or unique responses to experimental conditions.
-
----

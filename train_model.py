@@ -451,7 +451,7 @@ def main():
     val_files = []
     
     # Set maximum frame number for training (set to None to use all frames)
-    max_frame = 10000  # Only use clusters up to frame 10000
+    max_frame = 10000  # Only use clusters up to max_frame
     
     print("Loading data...")
     print(f"Using clusters up to frame {max_frame}" if max_frame is not None else "Using all clusters")
@@ -543,7 +543,7 @@ def main():
     criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=0.0002, weight_decay=1e-5)  # Reduced learning rate
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=50, verbose=True)
-    num_epochs = 300  # Increased epochs
+    num_epochs = 300
     
     print("\nStarting training...")
     # Training loop

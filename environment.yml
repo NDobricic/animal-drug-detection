@@ -1,0 +1,21 @@
+name: animal-lifespan-prediction
+channels:
+  - defaults
+  - conda-forge
+  - pytorch
+  - nvidia
+dependencies:
+  - python=3.9
+  - numpy>=1.24.0
+  - pandas>=2.0.0
+  - scikit-learn>=1.2.0
+  - jupyter>=1.0.0
+  - notebook>=6.5.0
+  - ipywidgets>=8.0.0
+  - matplotlib>=3.7.0
+  - seaborn>=0.12.0
+  - tqdm>=4.65.0
+  - pillow>=9.5.0
+  - pytorch>=2.0.0
+  - cudatoolkit=11.7  # Adjust this based on your CUDA version
+  - pytorch-cuda=11.7
