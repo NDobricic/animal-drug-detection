@@ -62,13 +62,13 @@ class ResidualLSTMBlock(nn.Module):
         return out
 
 class LSTMLifespanPredictor(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, dropout=0.2):
+    def __init__(self, input_size, hidden_size, num_layers, dropout=0.5):
         super(LSTMLifespanPredictor, self).__init__()
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         
         # Input normalization and embedding
-        self.batch_norm_input = nn.BatchNorm1d(input_size)
+        self.layer_norm_input = nn.LayerNorm(input_size)
         self.input_embedding = nn.Sequential(
             nn.Linear(input_size, hidden_size),
             nn.ReLU(),
@@ -79,53 +79,38 @@ class LSTMLifespanPredictor(nn.Module):
         self.lstm_stack = nn.ModuleList([
             ResidualLSTMBlock(hidden_size if i == 0 else hidden_size * 2,
                              hidden_size, 2, dropout)
-            for i in range(3)  # 3 blocks of stacked LSTMs
+            for i in range(1)
         ])
         
         # Multi-head attention layers
         self.attention_layers = nn.ModuleList([
             AttentionLayer(hidden_size * 2)
-            for _ in range(4)  # 4 attention heads
+            for _ in range(1)
         ])
         
         # Combine attention heads
         self.attention_combine = nn.Sequential(
-            nn.Linear(hidden_size * 8, hidden_size * 4),
-            nn.LayerNorm(hidden_size * 4),
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.LayerNorm(hidden_size),
             nn.ReLU(),
             nn.Dropout(dropout)
         )
         
         # Deep MLP for final prediction
         self.fc_layers = nn.Sequential(
-            nn.Linear(hidden_size * 4, hidden_size * 2),
-            nn.LayerNorm(hidden_size * 2),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            
-            nn.Linear(hidden_size * 2, hidden_size),
-            nn.LayerNorm(hidden_size),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            
             nn.Linear(hidden_size, hidden_size // 2),
             nn.LayerNorm(hidden_size // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
             
-            nn.Linear(hidden_size // 2, hidden_size // 4),
-            nn.LayerNorm(hidden_size // 4),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            
-            nn.Linear(hidden_size // 4, 1)
+            nn.Linear(hidden_size // 2, 1)
         )
     
     def forward(self, x, lengths):
         # Input normalization
         batch_size, seq_len, features = x.size()
         x = x.view(-1, features)
-        x = self.batch_norm_input(x)
+        x = self.layer_norm_input(x)
         x = x.view(batch_size, seq_len, features)
         
         # Input embedding
@@ -189,6 +174,7 @@ def load_data_from_directory(directory, max_frame=None):
     lengths = []
     file_paths = []
     cluster_counts = []  # Store cluster counts for each file
+    groups = []  # Store the group name
     
     files = [f for f in os.listdir(directory) if f.endswith('_features.npz')]
     for filename in tqdm(files, desc=f"Loading {os.path.basename(directory)}", leave=False):
@@ -220,6 +206,7 @@ def load_data_from_directory(directory, max_frame=None):
                 lengths.append(len(cluster_features))
                 file_paths.append(filepath)
                 cluster_counts.append((os.path.basename(filepath), total_clusters, len(cluster_features)))
+                groups.append(os.path.basename(directory))  # Store the group name
         else:
             # Use all features
             all_features.append(data['features'])
@@ -227,8 +214,9 @@ def load_data_from_directory(directory, max_frame=None):
             lengths.append(int(len(data['features'])))
             file_paths.append(filepath)
             cluster_counts.append((os.path.basename(filepath), total_clusters, total_clusters))
+            groups.append(os.path.basename(directory))  # Store the group name
     
-    return all_features, lifespans, lengths, file_paths, cluster_counts
+    return all_features, lifespans, lengths, file_paths, cluster_counts, groups
 
 def evaluate_model(model, val_loader, criterion, device, scale_factor=100000):
     model.eval()
@@ -429,131 +417,23 @@ def save_predictions(model, train_loader, val_loader, train_files, val_files,
     print(f"Min Percentage Error: {df[df['set'] == 'validation']['percent_error'].min():.2f}%")
     print(f"Max Percentage Error: {df[df['set'] == 'validation']['percent_error'].max():.2f}%")
 
-def main():
-    # Set random seed for reproducibility
-    random.seed(42)
-    torch.manual_seed(42)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(42)
-    
-    # Directories
-    base_dir = 'data/Lifespan_calculated'
-    subdirs = ['control', 'Terbinafin', 'controlTerbinafin', 'companyDrug']
-    
-    # Load all data and split into train/validation
-    all_features = []
-    all_lifespans = []
-    all_lengths = []
-    val_features = []
-    val_lifespans = []
-    val_lengths = []
-    train_files = []
-    val_files = []
-    
-    # Set maximum frame number for training (set to None to use all frames)
-    max_frame = 10000  # Only use clusters up to max_frame
-    
-    print("Loading data...")
-    print(f"Using clusters up to frame {max_frame}" if max_frame is not None else "Using all clusters")
-    
-    all_cluster_counts = []
-    for subdir in tqdm(subdirs, desc="Processing directories"):
-        dir_path = os.path.join(base_dir, subdir)
-        features, lifespans, lengths, file_paths, cluster_counts = load_data_from_directory(dir_path, max_frame=max_frame)
-        all_cluster_counts.extend(cluster_counts)
-        
-        # Randomly select 3 files for validation
-        if len(features) >= 3:  # Only if we have enough files after filtering
-            val_indices = random.sample(range(len(features)), 3)
-            
-            for i in range(len(features)):
-                if i in val_indices:
-                    val_files.extend([file_paths[i]])
-                    val_features.append(features[i])
-                    val_lifespans.append(lifespans[i])
-                    val_lengths.append(lengths[i])
-                else:
-                    train_files.extend([file_paths[i]])
-                    all_features.append(features[i])
-                    all_lifespans.append(lifespans[i])
-                    all_lengths.append(lengths[i])
-    
-    # Print cluster counts
-    print("\nCluster counts for each file:")
-    print(f"{'File':<60} {'Total Clusters':>15} {'Used Clusters':>15} {'Percent Used':>15}")
-    print("-" * 105)
-    for filename, total, used in sorted(all_cluster_counts):
-        percent = (used / total * 100) if total > 0 else 0
-        print(f"{filename:<60} {total:>15} {used:>15} {percent:>14.1f}%")
-    
-    # Print summary
-    total_clusters = sum(total for _, total, _ in all_cluster_counts)
-    used_clusters = sum(used for _, _, used in all_cluster_counts)
-    avg_percent = (used_clusters / total_clusters * 100) if total_clusters > 0 else 0
-    print("\nSummary:")
-    print(f"Total clusters across all files: {total_clusters}")
-    print(f"Clusters used in training: {used_clusters}")
-    print(f"Percentage of clusters used: {avg_percent:.1f}%")
-    
-    if len(val_files) < len(subdirs) * 3:
-        print(f"\nWarning: Could only find {len(val_files)} files for validation after filtering")
-        if len(val_files) == 0:
-            raise ValueError("No validation files found after filtering. Try increasing max_frame or set it to None.")
-    
-    # Print validation files for reference
-    print("\nValidation files:")
-    for file in val_files:
-        print(file)
-    
-    print("\nPreparing data for training...")
-    
-    # Standardize features
-    all_features_flat = np.vstack([f for f in all_features])
-    feature_scaler = StandardScaler()
-    feature_scaler.fit(all_features_flat)
-    
-    # Scale features
-    scaled_features = [feature_scaler.transform(f) for f in all_features]
-    scaled_val_features = [feature_scaler.transform(f) for f in val_features]
-    
-    # Scale lifespans by dividing by 100k
-    scale_factor = 100000
-    scaled_lifespans = np.array(all_lifespans) / scale_factor
-    scaled_val_lifespans = np.array(val_lifespans) / scale_factor
-    
-    # Save training data summary before training
-    save_training_data(train_files, all_features, all_lifespans, all_lengths,
-                      val_files, val_features, val_lifespans, val_lengths,
-                      feature_scaler)
-    
-    # Create PyTorch datasets
-    train_dataset = WormDataset(scaled_features, scaled_lifespans, all_lengths)
-    val_dataset = WormDataset(scaled_val_features, scaled_val_lifespans, val_lengths)
-    
-    train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, collate_fn=collate_fn)
-    val_loader = DataLoader(val_dataset, batch_size=len(val_dataset), shuffle=False, collate_fn=collate_fn)
-    
-    # Initialize model with increased complexity
-    input_size = scaled_features[0].shape[1]  # number of features
-    hidden_size = 512  # Increased hidden size
-    num_layers = 8    # Increased number of layers
-    model = LSTMLifespanPredictor(input_size, hidden_size, num_layers, dropout=0.3).to(device)
-    
-    # Training parameters
+def train_fold(train_loader, val_loader, input_size, hidden_size, num_layers, device, 
+               num_epochs=400, fold_num=None):
+    """Train a single fold and return the best model and metrics."""
+    model = LSTMLifespanPredictor(input_size, hidden_size, num_layers, dropout=0.5).to(device)
     criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0002, weight_decay=1e-5)  # Reduced learning rate
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0002, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=50, verbose=True)
-    num_epochs = 300
     
-    print("\nStarting training...")
-    # Training loop
     best_val_loss = float('inf')
+    best_model_state = None
     train_losses = []
     val_losses = []
     train_errors = []
     val_errors = []
     
-    for epoch in tqdm(range(num_epochs), desc="Training epochs"):
+    fold_desc = f"Fold {fold_num}" if fold_num is not None else "Training"
+    for epoch in tqdm(range(num_epochs), desc=f"{fold_desc} epochs"):
         # Training phase
         model.train()
         total_loss = 0
@@ -566,75 +446,308 @@ def main():
             outputs = model(batch_features, batch_lengths)
             loss = criterion(outputs, batch_lifespans)
             loss.backward()
-            
-            # Gradient clipping
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            
             optimizer.step()
             total_loss += loss.item()
         
         avg_train_loss = total_loss/len(train_loader)
         train_losses.append(avg_train_loss)
         
-        # Evaluate training error
+        # Evaluate training and validation errors
         _, _, _, train_error = evaluate_model(model, train_loader, criterion, device)
-        train_errors.append(train_error)
-        
-        # Validation phase
         val_loss, _, _, val_error = evaluate_model(model, val_loader, criterion, device)
+        train_errors.append(train_error)
         val_losses.append(val_loss)
         val_errors.append(val_error)
         
-        # Learning rate scheduling
         scheduler.step(val_loss)
         
-        # Save best model
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'train_loss': avg_train_loss,
-                'val_loss': val_loss,
-                'feature_scaler': feature_scaler,
-                'lifespan_scale_factor': 100000,
-                'input_size': input_size,
-                'hidden_size': hidden_size,
-                'num_layers': num_layers,
-                'train_losses': train_losses,
-                'val_losses': val_losses,
-                'train_errors': train_errors,
-                'val_errors': val_errors
-            }, 'best_lifespan_predictor_model.pth')
+            best_model_state = model.state_dict()
         
-        # Update plot and print status every N epochs
-        if (epoch + 1) % 10 == 0:  # Plot every 10 epochs
-            plot_losses(train_losses, val_losses, train_errors, val_errors)
-            tqdm.write(f'Epoch [{epoch+1}/{num_epochs}], Train Loss: {avg_train_loss:.4f}, Val Loss: {val_loss:.4f}')
+        if (epoch + 1) % 50 == 0:  # Print status less frequently for k-fold
+            tqdm.write(f'{fold_desc} - Epoch [{epoch+1}/{num_epochs}], Train Loss: {avg_train_loss:.4f}, Val Loss: {val_loss:.4f}')
             tqdm.write(f'Train Error: {train_error:.1f}%, Val Error: {val_error:.1f}%')
     
-    print("\nTraining complete. Best model saved as best_lifespan_predictor_model.pth")
-    print("Metrics plot saved as training_metrics.png")
+    # Load best model state
+    model.load_state_dict(best_model_state)
     
-    # Load best model for predictions
-    checkpoint = torch.load('best_lifespan_predictor_model.pth')
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # Save fold plots
+    plot_fold_metrics(train_losses, val_losses, train_errors, val_errors, fold_num)
     
-    # Save all predictions to CSV
-    save_predictions(model, train_loader, val_loader, train_files, val_files, 
-                    criterion, device, scale_factor)
+    return model, {
+        'train_losses': train_losses,
+        'val_losses': val_losses,
+        'train_errors': train_errors,
+        'val_errors': val_errors
+    }
+
+def plot_fold_metrics(train_losses, val_losses, train_errors, val_errors, fold_num, save_dir='plots'):
+    """Plot and save training metrics for a single fold."""
+    os.makedirs(save_dir, exist_ok=True)
     
-    # Get final predictions on validation set
-    _, predictions, targets, final_val_error = evaluate_model(model, val_loader, criterion, device, scale_factor)
+    plt.figure(figsize=(15, 6))
     
-    print("\nValidation Set Predictions:")
-    print("File                                     Predicted    Actual    Difference    % Error")
-    print("-" * 90)
-    for i, (pred, target, file) in enumerate(zip(predictions, targets, val_files)):
-        filename = os.path.basename(file)
-        percent_error = abs(pred[0] - target[0]) / target[0] * 100
-        print(f"{filename:<40} {pred[0]:>9.0f} {target[0]:>9.0f} {pred[0]-target[0]:>11.0f} {percent_error:>9.1f}%")
+    # Plot losses
+    plt.subplot(1, 2, 1)
+    plt.plot(train_losses, label='Training Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title(f'Fold {fold_num} - Training and Validation Losses')
+    plt.legend()
+    plt.grid(True)
+    
+    # Plot percentage errors
+    plt.subplot(1, 2, 2)
+    plt.plot(train_errors, label='Training Error')
+    plt.plot(val_errors, label='Validation Error')
+    plt.xlabel('Epoch')
+    plt.ylabel('Average Absolute Percentage Error')
+    plt.title(f'Fold {fold_num} - Training and Validation Errors')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, f'fold_{fold_num}_metrics.png'))
+    plt.close()
+
+def plot_all_folds_metrics(all_fold_metrics, save_dir='plots'):
+    """Plot and save aggregate metrics across all folds."""
+    plt.figure(figsize=(15, 6))
+    
+    # Plot losses
+    plt.subplot(1, 2, 1)
+    for fold, metrics in enumerate(all_fold_metrics):
+        plt.plot(metrics['val_losses'], label=f'Fold {fold+1}')
+    plt.xlabel('Epoch')
+    plt.ylabel('Validation Loss')
+    plt.title('Validation Losses Across All Folds')
+    plt.legend()
+    plt.grid(True)
+    
+    # Plot errors
+    plt.subplot(1, 2, 2)
+    for fold, metrics in enumerate(all_fold_metrics):
+        plt.plot(metrics['val_errors'], label=f'Fold {fold+1}')
+    plt.xlabel('Epoch')
+    plt.ylabel('Validation MAPE (%)')
+    plt.title('Validation Errors Across All Folds')
+    plt.legend()
+    plt.grid(True)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'all_folds_metrics.png'))
+    plt.close()
+
+def k_fold_cross_validation(features, lifespans, lengths, files, groups, feature_scaler, k=4, 
+                          input_size=None, hidden_size=128, num_layers=2, num_epochs=400):
+    """Perform stratified k-fold cross-validation and return detailed metrics."""
+    # Group indices by treatment group
+    group_indices = {}
+    for i, group in enumerate(groups):
+        if group not in group_indices:
+            group_indices[group] = []
+        group_indices[group].append(i)
+    
+    # Shuffle indices within each group
+    for group in group_indices:
+        random.shuffle(group_indices[group])
+    
+    # Calculate fold sizes for each group
+    group_fold_sizes = {group: len(indices) // k for group, indices in group_indices.items()}
+    
+    # Store metrics for each fold
+    fold_metrics_list = []  # Initialize the list to store fold metrics
+    all_predictions = []
+    
+    print(f"\nStarting {k}-fold stratified cross-validation...")
+    print("\nGroup distribution:")
+    for group, indices in group_indices.items():
+        print(f"{group}: {len(indices)} samples, {group_fold_sizes[group]} per fold")
+    
+    all_fold_metrics = []
+    
+    for fold in range(k):
+        print(f"\nTraining Fold {fold + 1}/{k}")
+        
+        # Create validation indices for this fold from each group
+        val_indices = []
+        train_indices = []
+        
+        for group, indices in group_indices.items():
+            fold_size = group_fold_sizes[group]
+            start_idx = fold * fold_size
+            end_idx = start_idx + fold_size if fold < k - 1 else len(indices)
+            
+            # Get validation indices for this group
+            group_val_indices = indices[start_idx:end_idx]
+            val_indices.extend(group_val_indices)
+            
+            # Get training indices for this group
+            group_train_indices = [idx for idx in indices if idx not in group_val_indices]
+            train_indices.extend(group_train_indices)
+        
+        # Print fold distribution
+        print("\nFold distribution:")
+        val_groups = [groups[i] for i in val_indices]
+        for group in set(groups):
+            count = val_groups.count(group)
+            print(f"{group} validation samples: {count}")
+        
+        # Prepare data for this fold
+        train_features = [features[i] for i in train_indices]
+        train_lifespans = [lifespans[i] for i in train_indices]
+        train_lengths = [lengths[i] for i in train_indices]
+        train_files = [files[i] for i in train_indices]
+        
+        val_features = [features[i] for i in val_indices]
+        val_lifespans = [lifespans[i] for i in val_indices]
+        val_lengths = [lengths[i] for i in val_indices]
+        val_files = [files[i] for i in val_indices]
+        
+        # Scale features
+        scaled_train_features = [feature_scaler.transform(f) for f in train_features]
+        scaled_val_features = [feature_scaler.transform(f) for f in val_features]
+        
+        # Scale lifespans
+        scale_factor = 100000
+        scaled_train_lifespans = np.array(train_lifespans) / scale_factor
+        scaled_val_lifespans = np.array(val_lifespans) / scale_factor
+        
+        # Create dataloaders
+        train_dataset = WormDataset(scaled_train_features, scaled_train_lifespans, train_lengths)
+        val_dataset = WormDataset(scaled_val_features, scaled_val_lifespans, val_lengths)
+        
+        train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, collate_fn=collate_fn)
+        val_loader = DataLoader(val_dataset, batch_size=len(val_dataset), shuffle=False, collate_fn=collate_fn)
+        
+        # Train model for this fold
+        model, fold_metrics = train_fold(
+            train_loader, val_loader, input_size, hidden_size, num_layers, 
+            device, num_epochs, fold + 1
+        )
+        all_fold_metrics.append(fold_metrics)
+        
+        # Evaluate final performance
+        val_loss, predictions, targets, val_error = evaluate_model(model, val_loader, nn.MSELoss(), device, scale_factor)
+        
+        # Calculate detailed metrics for this fold
+        fold_pred_data = []
+        for file, pred, target in zip(val_files, predictions, targets):
+            abs_error = abs(pred[0] - target[0])
+            pct_error = abs_error / target[0] * 100
+            fold_pred_data.append({
+                'file': os.path.basename(file),
+                'fold': fold + 1,
+                'predicted': int(pred[0]),
+                'actual': int(target[0]),
+                'abs_error': int(abs_error),
+                'pct_error': float(pct_error)
+            })
+        
+        # Store fold metrics
+        fold_metrics = {
+            'fold': fold + 1,
+            'val_loss': val_loss,
+            'mae': np.mean([d['abs_error'] for d in fold_pred_data]),
+            'mape': np.mean([d['pct_error'] for d in fold_pred_data]),
+            'std_ae': np.std([d['abs_error'] for d in fold_pred_data]),
+            'std_pe': np.std([d['pct_error'] for d in fold_pred_data]),
+            'num_samples': len(val_indices)
+        }
+        fold_metrics_list.append(fold_metrics)
+        
+        all_predictions.extend(fold_pred_data)
+    
+    # Calculate and print overall metrics
+    print("\nCross-Validation Results:")
+    print("\nPer-Fold Metrics:")
+    print(f"{'Fold':^6} {'MAE (frames)':^15} {'MAPE (%)':^12} {'Std AE':^12} {'Std PE (%)':^12} {'Samples':^8}")
+    print("-" * 70)
+    
+    for metrics in fold_metrics_list:
+        print(f"{metrics['fold']:^6} {metrics['mae']:>13.0f} {metrics['mape']:>11.2f} "
+              f"{metrics['std_ae']:>11.0f} {metrics['std_pe']:>11.2f} {metrics['num_samples']:^8}")
+    
+    # Calculate overall statistics
+    overall_mae = np.mean([m['mae'] for m in fold_metrics_list])
+    overall_mape = np.mean([m['mape'] for m in fold_metrics_list])
+    std_mae = np.std([m['mae'] for m in fold_metrics_list])
+    std_mape = np.std([m['mape'] for m in fold_metrics_list])
+    
+    print("\nOverall Cross-Validation Metrics:")
+    print(f"Mean Absolute Error: {overall_mae:.0f} ± {std_mae:.0f} frames")
+    print(f"Mean Absolute Percentage Error: {overall_mape:.2f}% ± {std_mape:.2f}%")
+    
+    # Save detailed predictions to CSV
+    df = pd.DataFrame(all_predictions)
+    df.to_csv('cross_validation_predictions.csv', index=False)
+    print("\nDetailed predictions saved to cross_validation_predictions.csv")
+    
+    # Plot aggregate metrics
+    plot_all_folds_metrics(all_fold_metrics)
+    
+    return fold_metrics_list, all_predictions
+
+def main():
+    # Set random seed for reproducibility
+    random.seed(42)
+    torch.manual_seed(42)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(42)
+    
+    # Directories
+    base_dir = 'data/Lifespan_calculated'
+    subdirs = ['control', 'Terbinafin', 'controlTerbinafin', 'companyDrug']
+    
+    # Load all data
+    all_features = []
+    all_lifespans = []
+    all_lengths = []
+    all_files = []
+    all_groups = []
+    
+    # Set maximum frame number for training (set to None to use all frames)
+    max_frame = 30000  # Only use clusters up to max_frame
+    
+    print("Loading data...")
+    print(f"Using clusters up to frame {max_frame}" if max_frame is not None else "Using all clusters")
+    
+    all_cluster_counts = []
+    for subdir in tqdm(subdirs, desc="Processing directories"):
+        dir_path = os.path.join(base_dir, subdir)
+        features, lifespans, lengths, file_paths, cluster_counts, groups = load_data_from_directory(dir_path, max_frame=max_frame)
+        all_cluster_counts.extend(cluster_counts)
+        
+        all_features.extend(features)
+        all_lifespans.extend(lifespans)
+        all_lengths.extend(lengths)
+        all_files.extend(file_paths)
+        all_groups.extend(groups)
+    
+    # Print cluster counts
+    print("\nCluster counts for each file:")
+    print(f"{'File':<60} {'Total Clusters':>15} {'Used Clusters':>15} {'Percent Used':>15}")
+    print("-" * 105)
+    for filename, total, used in sorted(all_cluster_counts):
+        percent = (used / total * 100) if total > 0 else 0
+        print(f"{filename:<60} {total:>15} {used:>15} {percent:>14.1f}%")
+    
+    # Standardize features
+    all_features_flat = np.vstack([f for f in all_features])
+    feature_scaler = StandardScaler()
+    feature_scaler.fit(all_features_flat)
+    
+    # Get input size from features
+    input_size = all_features[0].shape[1]
+    
+    # Perform k-fold cross-validation
+    k_fold_cross_validation(
+        all_features, all_lifespans, all_lengths, all_files, all_groups,
+        feature_scaler, k=4, input_size=input_size
+    )
 
 if __name__ == "__main__":
     main() 
