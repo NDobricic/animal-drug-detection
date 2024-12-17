@@ -3,7 +3,7 @@ import os
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
-from torch.nn.utils.rnn import pack_padded_sequence, pad_sequence
+from torch.nn.utils.rnn import pack_padded_sequence, pad_sequence, PackedSequence
 import random
 from tqdm import tqdm
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
@@ -11,130 +11,58 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import json
 
+# Load configuration
+with open('train_model_config.json', 'r') as f:
+    CONFIG = json.load(f)
+
 # Check if GPU is available
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"Using device: {device}")
 
-class AttentionLayer(nn.Module):
-    def __init__(self, hidden_size):
-        super(AttentionLayer, self).__init__()
-        self.attention = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size),
-            nn.Tanh(),
-            nn.Linear(hidden_size, 1)
-        )
-    
-    def forward(self, hidden_states, mask=None):
-        attention_weights = self.attention(hidden_states)
-        if mask is not None:
-            attention_weights = attention_weights.masked_fill(mask.unsqueeze(-1) == 0, float('-inf'))
-        attention_weights = torch.softmax(attention_weights, dim=1)
-        attended = torch.sum(attention_weights * hidden_states, dim=1)
-        return attended, attention_weights
-
-class ResidualLSTMBlock(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, dropout):
-        super(ResidualLSTMBlock, self).__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers,
-                           batch_first=True, dropout=dropout if num_layers > 1 else 0,
+class SimpleLSTMPredictor(nn.Module):
+    def __init__(self, input_size, config):
+        super().__init__()
+        self.hidden_size = config['model']['hidden_size']
+        self.num_layers = config['model']['num_layers']
+        self.dropout = config['model']['dropout']
+        
+        # Input normalization
+        self.layer_norm = nn.LayerNorm(input_size)
+        
+        # LSTM layer
+        self.lstm = nn.LSTM(input_size, self.hidden_size, self.num_layers,
+                           batch_first=True, dropout=self.dropout if self.num_layers > 1 else 0,
                            bidirectional=True)
-        self.norm = nn.LayerNorm(hidden_size * 2)
-        self.dropout = nn.Dropout(dropout)
         
-        # If input and output sizes don't match, use a linear projection
-        self.projection = None
-        if input_size != hidden_size * 2:
-            self.projection = nn.Linear(input_size, hidden_size * 2)
-    
-    def forward(self, x, lengths):
-        packed_x = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
-        packed_out, _ = self.lstm(packed_x)
-        out, _ = nn.utils.rnn.pad_packed_sequence(packed_out, batch_first=True)
-        
-        # Apply residual connection if shapes match
-        if self.projection is not None:
-            residual = self.projection(x)
-        else:
-            residual = x
-            
-        out = self.dropout(out)
-        out = self.norm(out + residual)
-        return out
-
-class LSTMLifespanPredictor(nn.Module):
-    def __init__(self, input_size, hidden_size, num_layers, dropout=0.5):
-        super(LSTMLifespanPredictor, self).__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        
-        # Input normalization and embedding
-        self.layer_norm_input = nn.LayerNorm(input_size)
-        self.input_embedding = nn.Sequential(
-            nn.Linear(input_size, hidden_size),
-            nn.ReLU(),
-            nn.Dropout(dropout)
-        )
-        
-        # Stack of residual LSTM blocks
-        self.lstm_stack = nn.ModuleList([
-            ResidualLSTMBlock(hidden_size if i == 0 else hidden_size * 2,
-                             hidden_size, 2, dropout)
-            for i in range(1)
-        ])
-        
-        # Multi-head attention layers
-        self.attention_layers = nn.ModuleList([
-            AttentionLayer(hidden_size * 2)
-            for _ in range(1)
-        ])
-        
-        # Combine attention heads
-        self.attention_combine = nn.Sequential(
-            nn.Linear(hidden_size * 2, hidden_size),
-            nn.LayerNorm(hidden_size),
-            nn.ReLU(),
-            nn.Dropout(dropout)
-        )
-        
-        # Deep MLP for final prediction
+        # Output layers
         self.fc_layers = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size // 2),
-            nn.LayerNorm(hidden_size // 2),
+            nn.Linear(self.hidden_size * 2, self.hidden_size),
+            nn.LayerNorm(self.hidden_size),
             nn.ReLU(),
-            nn.Dropout(dropout),
-            
-            nn.Linear(hidden_size // 2, 1)
+            nn.Dropout(self.dropout),
+            nn.Linear(self.hidden_size, 1)
         )
     
     def forward(self, x, lengths):
         # Input normalization
         batch_size, seq_len, features = x.size()
         x = x.view(-1, features)
-        x = self.layer_norm_input(x)
+        x = self.layer_norm(x)
         x = x.view(batch_size, seq_len, features)
         
-        # Input embedding
-        x = self.input_embedding(x)
+        # Pack sequence for LSTM
+        packed_x = pack_padded_sequence(x, lengths.cpu(), batch_first=True, enforce_sorted=False)
         
-        # Create attention mask based on lengths
-        mask = torch.arange(seq_len).expand(batch_size, seq_len).to(x.device) < lengths.unsqueeze(1)
+        # Process through LSTM
+        packed_out, _ = self.lstm(packed_x)
+        out, _ = nn.utils.rnn.pad_packed_sequence(packed_out, batch_first=True)
         
-        # Process through LSTM stack
-        for lstm_block in self.lstm_stack:
-            x = lstm_block(x, lengths)
-        
-        # Multi-head attention
-        attention_outputs = []
-        for attention in self.attention_layers:
-            attended, _ = attention(x, mask)
-            attention_outputs.append(attended)
-        
-        # Combine attention heads
-        combined = torch.cat(attention_outputs, dim=1)
-        combined = self.attention_combine(combined)
+        # Use the last output for each sequence
+        idx = (lengths - 1).view(-1, 1).expand(-1, self.hidden_size * 2).unsqueeze(1)
+        out = out.gather(1, idx).squeeze(1)
         
         # Final prediction
-        return self.fc_layers(combined)
+        return self.fc_layers(out)
 
 class WormDataset(Dataset):
     def __init__(self, features, lifespans, lengths):
@@ -218,7 +146,8 @@ def load_data_from_directory(directory, max_frame=None):
     
     return all_features, lifespans, lengths, file_paths, cluster_counts, groups
 
-def evaluate_model(model, val_loader, criterion, device, scale_factor=100000):
+def evaluate_model(model, val_loader, criterion, device, config):
+    scale_factor = config['training']['scale_factor']
     model.eval()
     total_loss = 0
     all_predictions = []
@@ -333,14 +262,15 @@ def plot_losses(train_losses, val_losses, train_errors, val_errors, save_path='t
     plt.close()
 
 def save_predictions(model, train_loader, val_loader, train_files, val_files, 
-                    criterion, device, scale_factor=100000):
+                    criterion, device, config):
+    scale_factor = config['training']['scale_factor']
     """Save predictions for all samples to a CSV file."""
     model.eval()
     all_predictions = []
     
     # Process training data
     print("\nGenerating predictions for training set...")
-    _, train_preds, train_targets, train_error = evaluate_model(model, train_loader, criterion, device, scale_factor)
+    _, train_preds, train_targets, train_error = evaluate_model(model, train_loader, criterion, device, config)
     train_mape = 0
     for file, pred, target in zip(train_files, train_preds, train_targets):
         percent_error = float(abs(pred[0] - target[0]) / target[0] * 100)
@@ -357,7 +287,7 @@ def save_predictions(model, train_loader, val_loader, train_files, val_files,
     
     # Process validation data
     print("Generating predictions for validation set...")
-    _, val_preds, val_targets, val_error = evaluate_model(model, val_loader, criterion, device, scale_factor)
+    _, val_preds, val_targets, val_error = evaluate_model(model, val_loader, criterion, device, config)
     val_mape = 0
     for file, pred, target in zip(val_files, val_preds, val_targets):
         percent_error = float(abs(pred[0] - target[0]) / target[0] * 100)
@@ -417,13 +347,22 @@ def save_predictions(model, train_loader, val_loader, train_files, val_files,
     print(f"Min Percentage Error: {df[df['set'] == 'validation']['percent_error'].min():.2f}%")
     print(f"Max Percentage Error: {df[df['set'] == 'validation']['percent_error'].max():.2f}%")
 
-def train_fold(train_loader, val_loader, input_size, hidden_size, num_layers, device, 
-               num_epochs=400, fold_num=None):
+def train_fold(train_loader, val_loader, input_size, config, device, fold_num=None):
     """Train a single fold and return the best model and metrics."""
-    model = LSTMLifespanPredictor(input_size, hidden_size, num_layers, dropout=0.5).to(device)
+    model = SimpleLSTMPredictor(input_size, config).to(device)
     criterion = nn.MSELoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=0.0002, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=50, verbose=True)
+    optimizer = torch.optim.Adam(
+        model.parameters(), 
+        lr=config['training']['learning_rate'], 
+        weight_decay=config['training']['weight_decay']
+    )
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, 
+        mode='min', 
+        factor=config['training']['scheduler']['factor'], 
+        patience=config['training']['scheduler']['patience'], 
+        verbose=True
+    )
     
     best_val_loss = float('inf')
     best_model_state = None
@@ -433,7 +372,7 @@ def train_fold(train_loader, val_loader, input_size, hidden_size, num_layers, de
     val_errors = []
     
     fold_desc = f"Fold {fold_num}" if fold_num is not None else "Training"
-    for epoch in tqdm(range(num_epochs), desc=f"{fold_desc} epochs"):
+    for epoch in tqdm(range(config['training']['num_epochs']), desc=f"{fold_desc} epochs"):
         # Training phase
         model.train()
         total_loss = 0
@@ -446,7 +385,7 @@ def train_fold(train_loader, val_loader, input_size, hidden_size, num_layers, de
             outputs = model(batch_features, batch_lengths)
             loss = criterion(outputs, batch_lifespans)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=config['training']['gradient_clip'])
             optimizer.step()
             total_loss += loss.item()
         
@@ -454,8 +393,8 @@ def train_fold(train_loader, val_loader, input_size, hidden_size, num_layers, de
         train_losses.append(avg_train_loss)
         
         # Evaluate training and validation errors
-        _, _, _, train_error = evaluate_model(model, train_loader, criterion, device)
-        val_loss, _, _, val_error = evaluate_model(model, val_loader, criterion, device)
+        _, _, _, train_error = evaluate_model(model, train_loader, criterion, device, config)
+        val_loss, _, _, val_error = evaluate_model(model, val_loader, criterion, device, config)
         train_errors.append(train_error)
         val_losses.append(val_loss)
         val_errors.append(val_error)
@@ -467,7 +406,7 @@ def train_fold(train_loader, val_loader, input_size, hidden_size, num_layers, de
             best_model_state = model.state_dict()
         
         if (epoch + 1) % 50 == 0:  # Print status less frequently for k-fold
-            tqdm.write(f'{fold_desc} - Epoch [{epoch+1}/{num_epochs}], Train Loss: {avg_train_loss:.4f}, Val Loss: {val_loss:.4f}')
+            tqdm.write(f'{fold_desc} - Epoch [{epoch+1}/{config["training"]["num_epochs"]}], Train Loss: {avg_train_loss:.4f}, Val Loss: {val_loss:.4f}')
             tqdm.write(f'Train Error: {train_error:.1f}%, Val Error: {val_error:.1f}%')
     
     # Load best model state
@@ -489,17 +428,17 @@ def plot_fold_metrics(train_losses, val_losses, train_errors, val_errors, fold_n
     
     plt.figure(figsize=(15, 6))
     
-    # Plot losses
+    # Plot losses with log scale
     plt.subplot(1, 2, 1)
-    plt.plot(train_losses, label='Training Loss')
-    plt.plot(val_losses, label='Validation Loss')
+    plt.semilogy(train_losses, label='Training Loss')  # Use semilogy for log scale
+    plt.semilogy(val_losses, label='Validation Loss')
     plt.xlabel('Epoch')
-    plt.ylabel('Loss')
+    plt.ylabel('Loss (log scale)')
     plt.title(f'Fold {fold_num} - Training and Validation Losses')
     plt.legend()
-    plt.grid(True)
+    plt.grid(True, which="both", ls="-", alpha=0.2)  # Add grid for both major and minor ticks
     
-    # Plot percentage errors
+    # Plot percentage errors (keep linear scale)
     plt.subplot(1, 2, 2)
     plt.plot(train_errors, label='Training Error')
     plt.plot(val_errors, label='Validation Error')
@@ -517,17 +456,17 @@ def plot_all_folds_metrics(all_fold_metrics, save_dir='plots'):
     """Plot and save aggregate metrics across all folds."""
     plt.figure(figsize=(15, 6))
     
-    # Plot losses
+    # Plot losses with log scale
     plt.subplot(1, 2, 1)
     for fold, metrics in enumerate(all_fold_metrics):
-        plt.plot(metrics['val_losses'], label=f'Fold {fold+1}')
+        plt.semilogy(metrics['val_losses'], label=f'Fold {fold+1}')  # Use semilogy for log scale
     plt.xlabel('Epoch')
-    plt.ylabel('Validation Loss')
+    plt.ylabel('Validation Loss (log scale)')
     plt.title('Validation Losses Across All Folds')
     plt.legend()
-    plt.grid(True)
+    plt.grid(True, which="both", ls="-", alpha=0.2)  # Add grid for both major and minor ticks
     
-    # Plot errors
+    # Plot errors (keep linear scale)
     plt.subplot(1, 2, 2)
     for fold, metrics in enumerate(all_fold_metrics):
         plt.plot(metrics['val_errors'], label=f'Fold {fold+1}')
@@ -541,9 +480,11 @@ def plot_all_folds_metrics(all_fold_metrics, save_dir='plots'):
     plt.savefig(os.path.join(save_dir, 'all_folds_metrics.png'))
     plt.close()
 
-def k_fold_cross_validation(features, lifespans, lengths, files, groups, feature_scaler, k=4, 
-                          input_size=None, hidden_size=128, num_layers=2, num_epochs=400):
+def k_fold_cross_validation(features, lifespans, lengths, files, groups, feature_scaler, config, input_size):
     """Perform stratified k-fold cross-validation and return detailed metrics."""
+    k = config['training']['num_folds']
+    scale_factor = config['training']['scale_factor']
+    batch_size = config['training']['batch_size']
     # Group indices by treatment group
     group_indices = {}
     for i, group in enumerate(groups):
@@ -620,18 +561,18 @@ def k_fold_cross_validation(features, lifespans, lengths, files, groups, feature
         train_dataset = WormDataset(scaled_train_features, scaled_train_lifespans, train_lengths)
         val_dataset = WormDataset(scaled_val_features, scaled_val_lifespans, val_lengths)
         
-        train_loader = DataLoader(train_dataset, batch_size=4, shuffle=True, collate_fn=collate_fn)
+        train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
         val_loader = DataLoader(val_dataset, batch_size=len(val_dataset), shuffle=False, collate_fn=collate_fn)
         
         # Train model for this fold
         model, fold_metrics = train_fold(
-            train_loader, val_loader, input_size, hidden_size, num_layers, 
-            device, num_epochs, fold + 1
+            train_loader, val_loader, input_size, config, 
+            device, fold + 1
         )
         all_fold_metrics.append(fold_metrics)
         
         # Evaluate final performance
-        val_loss, predictions, targets, val_error = evaluate_model(model, val_loader, nn.MSELoss(), device, scale_factor)
+        val_loss, predictions, targets, val_error = evaluate_model(model, val_loader, nn.MSELoss(), device, config)
         
         # Calculate detailed metrics for this fold
         fold_pred_data = []
@@ -693,14 +634,14 @@ def k_fold_cross_validation(features, lifespans, lengths, files, groups, feature
 
 def main():
     # Set random seed for reproducibility
-    random.seed(42)
-    torch.manual_seed(42)
+    random.seed(CONFIG['random_seed'])
+    torch.manual_seed(CONFIG['random_seed'])
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(42)
+        torch.cuda.manual_seed(CONFIG['random_seed'])
     
-    # Directories
-    base_dir = 'data/Lifespan_calculated'
-    subdirs = ['control', 'Terbinafin', 'controlTerbinafin', 'companyDrug']
+    # Load data paths from config
+    base_dir = CONFIG['data']['base_dir']
+    subdirs = CONFIG['data']['subdirs']
     
     # Load all data
     all_features = []
@@ -709,8 +650,8 @@ def main():
     all_files = []
     all_groups = []
     
-    # Set maximum frame number for training (set to None to use all frames)
-    max_frame = 30000  # Only use clusters up to max_frame
+    # Get maximum frame number from config
+    max_frame = CONFIG['training']['max_frame']
     
     print("Loading data...")
     print(f"Using clusters up to frame {max_frame}" if max_frame is not None else "Using all clusters")
@@ -746,7 +687,7 @@ def main():
     # Perform k-fold cross-validation
     k_fold_cross_validation(
         all_features, all_lifespans, all_lengths, all_files, all_groups,
-        feature_scaler, k=4, input_size=input_size
+        feature_scaler, CONFIG, input_size
     )
 
 if __name__ == "__main__":
